@@ -50,15 +50,24 @@ const dbg = (msg: string) => {
 
 // Deepgram streaming endpoint. Tuning notes:
 //   model=nova-3        — flagship, sub-300ms latency, best accuracy
+//   language=zh-TW      — Traditional Chinese (Mandarin). nova-3 outputs
+//                         Traditional Han script natively — no post-conversion
+//                         needed. Override via the DICTATE_LANGUAGE env var:
+//                         "en" (English), "zh"/"zh-CN" (Simplified),
+//                         "zh-HK" (Cantonese), or any nova-3 language code.
+//                         NOTE: "multi" (code-switching) does NOT include
+//                         Chinese, so it can't be used for zh dictation.
 //   encoding=linear16   — raw 16-bit PCM (what sox/rec gives us with -e signed-integer -b 16)
 //   sample_rate=16000   — 16kHz mono is the standard low-bandwidth STT format
 //   interim_results=false — we only want finals, never partials
 //   smart_format=true   — formats numbers, dates, currencies nicely
 //   punctuate=true      — adds commas/periods/question marks
 //   endpointing=300     — 300ms of silence ends an utterance (faster finals)
+const DG_LANGUAGE = process.env.DICTATE_LANGUAGE || "zh-TW";
 const DG_URL =
   "wss://api.deepgram.com/v1/listen" +
   "?model=nova-3" +
+  `&language=${encodeURIComponent(DG_LANGUAGE)}` +
   "&encoding=linear16" +
   "&sample_rate=16000" +
   "&channels=1" +
@@ -82,6 +91,13 @@ type State = "idle" | "recording" | "stopping";
 interface EditorLike {
   getText(): string;
   setText(text: string): void;
+}
+// Minimal structural view of the pi/omp TUI handle we capture. Members are
+// optional because omp's TUI omits some pi-only surfaces (e.g. focusedComponent).
+interface TuiHandle {
+  addInputListener?(listener: (data: string) => { consume?: boolean } | undefined): () => void;
+  focusedComponent?: unknown;
+  requestRender?(): void;
 }
 type Target =
   | { kind: "editor"; editor: EditorLike }
@@ -209,6 +225,11 @@ export default function (pi: ExtensionAPI) {
   let tuiHandle: any = null;
   let removeInputListener: (() => void) | null = null;
   let lastCtx: ExtensionContext | null = null;
+  // Focus-aware delivery relies on `tui.focusedComponent`, a pi-only property.
+  // omp's TUI does not expose it — detect that so we degrade to the legacy
+  // main-editor append path (ctx.ui.get/setEditorText) instead of blocking on
+  // the start guard and mis-resolving delivery to the clipboard.
+  const focusApiAvailable = () => !!tuiHandle && "focusedComponent" in tuiHandle;
 
   /** Resolve where dictated text would go RIGHT NOW, based on keyboard focus. */
   const resolveTarget = (): Target | null => {
@@ -235,7 +256,7 @@ export default function (pi: ExtensionAPI) {
 
     // Legacy fallback: no TUI handle captured (non-TUI mode / older pi) —
     // append to the main chat editor exactly as before.
-    if (!tuiHandle) {
+    if (!tuiHandle || !focusApiAvailable()) {
       const current = activeCtx.ui.getEditorText() ?? "";
       const sep = current && !/\s$/.test(current) ? " " : "";
       activeCtx.ui.setEditorText(current + sep + text);
@@ -470,7 +491,7 @@ export default function (pi: ExtensionAPI) {
   const toggleDictation = (ctx: ExtensionContext) => {
     lastCtx = ctx;
     if (state === "idle") {
-      if (tuiHandle && !resolveTarget()) {
+      if (focusApiAvailable() && !resolveTarget()) {
         ctx.ui.notify("No input field is focused — dictation not started", "warning");
         return;
       }
@@ -509,13 +530,23 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", (_event, ctx) => {
     lastCtx = ctx;
-    if (ctx.mode !== "tui" || tuiHandle) return;
+    // pi exposes `ctx.mode === "tui"`; omp replaced that with `ctx.hasUI`
+    // (no `mode` field). Cast to the union of both shapes and prefer hasUI.
+    const uiCtx = ctx as { hasUI?: boolean; mode?: string };
+    const uiAvailable = typeof uiCtx.hasUI === "boolean" ? uiCtx.hasUI : uiCtx.mode === "tui";
+    dbg(`session_start hasUI=${uiCtx.hasUI} mode=${uiCtx.mode} uiAvailable=${uiAvailable} tuiHandle=${!!tuiHandle}`);
+    if (!uiAvailable || tuiHandle) return;
     // Capture the TUI handle via an invisible zero-height widget. The
     // listener function reference is stable, so even if the factory re-runs
     // the TUI's listener Set de-dupes it.
-    ctx.ui.setWidget("dictate-tui-handle", (tui: any) => {
+    ctx.ui.setWidget("dictate-tui-handle", (tui: TuiHandle) => {
+      dbg(`widget factory: addInputListener=${typeof tui?.addInputListener} hasFocusedComponent=${!!tui && "focusedComponent" in tui}`);
       tuiHandle = tui;
-      removeInputListener = tui.addInputListener(onGlobalInput);
+      if (typeof tui?.addInputListener === "function") {
+        removeInputListener = tui.addInputListener(onGlobalInput);
+      } else {
+        dbg("addInputListener MISSING — global listener not installed");
+      }
       return { render: () => [], invalidate: () => {} };
     });
   });

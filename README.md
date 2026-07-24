@@ -10,7 +10,7 @@ Minimal voice dictation for pi. No floating bubbles, no menu bar app, no notific
   - Nothing text-capable focused → transcript is copied to the clipboard (via `pbcopy`, so macOS-only) and a notification says so. A finished dictation is never lost.
 - **Start guard:** if no input field is focused when you press `alt+m`, dictation doesn't start and a notification explains why.
 - **Live feedback:** while recording, the status row shows a red `●` plus a real-time mic-level meter (`● ▂▅▇ listening…`) — instant confirmation your mic is live. On stop it flips to a `finalizing…` spinner.
-- **Backend:** Deepgram Nova-3 streaming
+- **Backend:** Deepgram Nova-3 streaming. Defaults to **Traditional Chinese** (`language=zh-TW`); set `DICTATE_LANGUAGE` to switch (see Customizing).
 - **What's "real-time":** audio is transcribed *while you talk*; the finalized text is inserted in one shot when you stop. Stop-to-display latency is typically ~300-500ms.
 
 ## Install
@@ -50,12 +50,37 @@ Run `/reload` in pi after first install (or after editing `index.ts`) to pick up
 - On stop, the extension sends `{"type": "CloseStream"}`, waits for the server to flush, and concatenates all finals. (If Deepgram never closes the socket, a 3s timeout forces finalization.)
 - **Focus-aware delivery:** the extension captures pi's `TUI` instance once (via an invisible zero-height widget) and installs a `tui.addInputListener` handler — listeners run *before* the focused component, which is why `alt+m` works inside dialogs (extension shortcuts are otherwise only matched by the main editor). Kitty-protocol key **release/repeat** events are filtered out, so one physical press toggles exactly once. On stop it inspects `tui.focusedComponent`: editor-like components (anything with `getText`/`setText`, including popups' inner `.editor`) get a direct append; opaque components get the text as synthetic keystrokes routed by their own focus logic.
 
+## omp (oh-my-pi) compatibility
+
+This extension also runs under [omp](https://github.com/oh-my-pi) — a pi fork with a slightly different runtime. Two differences are handled automatically; one needs a manual keybinding tweak.
+
+**Install into omp:**
+
+```bash
+omp plugin install .                              # from a local checkout
+omp plugin install git:github.com/amosblomqvist/pi-dictate   # or from git
+```
+
+**Manual step — free `alt+m`:** omp binds `alt+m` to its built-in model selector by default, which shadows the dictation toggle. Move it aside in `~/.omp/agent/keybindings.yml`:
+
+```yaml
+app.model.select: alt+shift+m
+```
+
+Model selection stays reachable via the `/model` command. `alt+n` (cancel) is unbound in omp, so it needs no change.
+
+**Handled automatically (no action needed):**
+
+- **Session detection:** omp's extension context exposes `ctx.hasUI` instead of pi's `ctx.mode === "tui"`. The extension checks whichever is present before installing its global input listener, so the `alt+m`/`alt+n` toggles work in both runtimes.
+- **Delivery target:** omp's TUI does not expose `focusedComponent`, so the focus-aware, dialog-targeted delivery is pi-only. Under omp the transcript is appended to the main chat input instead (and the "no input field focused" start guard is skipped, since delivery always has a home).
+
 ## Customizing
 
 All knobs are at the top of `index.ts`:
 
 - **Hotkey:** change the `Key.alt("m")` / `Key.alt("n")` references near the bottom (the input listener `onGlobalInput` and the fallback `pi.registerShortcut` calls).
 - **Model:** edit `DG_URL` — swap `model=nova-3` for `nova-2`, `enhanced`, etc.
+- **Language:** set the `DICTATE_LANGUAGE` env var (default `zh-TW`, Traditional Chinese). Examples: `en` (English), `zh`/`zh-CN` (Simplified Chinese), `zh-HK` (Cantonese), or any [nova-3 language code](https://developers.deepgram.com/docs/models-languages-overview#nova-3). nova-3 emits Traditional Han script natively for `zh-TW`, so no post-conversion is needed. Note: `multi` (code-switching) does **not** include Chinese.
 - **Endpointing (how long a silence ends an utterance):** `endpointing=300` in the URL. Lower = faster finals, more fragmentation. Higher = slower finals, more coherent chunks.
 - **Smart formatting / punctuation:** toggle `smart_format` and `punctuate` in the URL.
 - **Level meter:** `METER_CELLS` (width in bars), `METER_TICK_MS` (update rate), `METER_FLOOR_DB` / `METER_CEILING_DB` (loudness range mapped to empty/full bars).

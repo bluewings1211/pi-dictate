@@ -1,0 +1,6 @@
+# Benchmark-only dependencies for MediaTek-Research/Breeze-ASR-25.
+torch
+torchaudio
+transformers
+accelerate
+datasets[audio]

@@ -10,7 +10,7 @@ Minimal voice dictation for pi. No floating bubbles, no menu bar app, no notific
   - Nothing text-capable focused → transcript is copied to the clipboard (via `pbcopy`, so macOS-only) and a notification says so. A finished dictation is never lost.
 - **Start guard:** if no input field is focused when you press `alt+m`, dictation doesn't start and a notification explains why.
 - **Live feedback:** while recording, the status row shows a red `●` plus a real-time mic-level meter (`● ▂▅▇ listening…`) — instant confirmation your mic is live. On stop it flips to a `finalizing…` spinner.
-- **Backend:** Deepgram Nova-3 streaming. Defaults to **Traditional Chinese** (`language=zh-TW`); set `DICTATE_LANGUAGE` to switch (see Customizing).
+- **Backend:** Deepgram Nova-3 streaming by default. A local Qwen3-ASR-0.6B backend is also available for Apple Silicon; see [local-stt/README.md](local-stt/README.md).
 - **What's "real-time":** audio is transcribed *while you talk*; the finalized text is inserted in one shot when you stop. Stop-to-display latency is typically ~300-500ms.
 
 ## Install
@@ -80,6 +80,7 @@ All knobs are at the top of `index.ts`:
 
 - **Hotkey:** change the `Key.alt("m")` / `Key.alt("n")` references near the bottom (the input listener `onGlobalInput` and the fallback `pi.registerShortcut` calls).
 - **Model:** edit `DG_URL` — swap `model=nova-3` for `nova-2`, `enhanced`, etc.
+- **Backend:** set `DICTATE_BACKEND=deepgram` (default) or `DICTATE_BACKEND=local`. Local mode sends audio only to `LOCAL_STT_URL` (default `http://127.0.0.1:8765`) and does not require `DEEPGRAM_API_KEY`. Start the companion service first; its Qwen setup and the Breeze-ASR-25 benchmark workflow are in [local-stt/README.md](local-stt/README.md).
 - **Language:** set the `DICTATE_LANGUAGE` env var (default `zh-TW`, Traditional Chinese). Examples: `en` (English), `zh`/`zh-CN` (Simplified Chinese), `zh-HK` (Cantonese), or any [nova-3 language code](https://developers.deepgram.com/docs/models-languages-overview#nova-3). nova-3 emits Traditional Han script natively for `zh-TW`, so no post-conversion is needed. Note: `multi` (code-switching) does **not** include Chinese.
 - **Endpointing (how long a silence ends an utterance):** `endpointing=300` in the URL. Lower = faster finals, more fragmentation. Higher = slower finals, more coherent chunks.
 - **Smart formatting / punctuation:** toggle `smart_format` and `punctuate` in the URL.

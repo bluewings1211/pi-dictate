@@ -1,0 +1,9 @@
+{
+  "clips": [
+    {
+      "id": "taiwan-mixed-001",
+      "audio": "/absolute/path/to/taiwan-mixed-001.wav",
+      "reference": "我今天要 review 這個 pull request。"
+    }
+  ]
+}

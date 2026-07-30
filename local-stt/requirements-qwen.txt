@@ -1,0 +1,2 @@
+# Apple Silicon Qwen3-ASR runtime. Install in an isolated Python environment.
+mlx-qwen3-asr[serve]

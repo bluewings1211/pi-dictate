@@ -76,6 +76,15 @@ const DG_URL =
   "&punctuate=true" +
   "&endpointing=300";
 
+// Recognizer selection. `deepgram` remains the default so existing installs
+// keep working unchanged. `local` sends audio only to LOCAL_STT_URL, which is
+// expected to be a loopback service from local-stt/server.py.
+type RecognizerBackend = "deepgram" | "local";
+const configuredBackend = process.env.DICTATE_BACKEND || "deepgram";
+const RECOGNIZER_BACKEND: RecognizerBackend | null =
+  configuredBackend === "deepgram" || configuredBackend === "local" ? configuredBackend : null;
+const LOCAL_STT_URL = (process.env.LOCAL_STT_URL || "http://127.0.0.1:8765").replace(/\/$/, "");
+
 type State = "idle" | "recording" | "stopping";
 
 // ── Focus-aware delivery ──────────────────────────────────────────────────
@@ -169,6 +178,13 @@ export default function (pi: ExtensionAPI) {
   let meterTimer: NodeJS.Timeout | null = null;
   let meter: number[] = new Array(METER_CELLS).fill(0);
   let currentLevel = 0;
+  // Local mode keeps the raw PCM from this dictation only until `rec` closes,
+  // then posts it to loopback for a final-only transcription. At 16 kHz mono
+  // this is ~1.9 MB/minute, a reasonable trade-off for keeping this first
+  // local backend simple and preserving the current final-only editor UX.
+  let localPcmChunks: Buffer[] = [];
+  let localRequest: AbortController | null = null;
+  let localFinalizeStarted = false;
 
   const setStatus = (msg: string | undefined) => {
     if (!activeCtx) return;
@@ -313,6 +329,12 @@ export default function (pi: ExtensionAPI) {
       } catch {}
       ws = null;
     }
+    if (localRequest) {
+      localRequest.abort();
+      localRequest = null;
+    }
+    localPcmChunks = [];
+    localFinalizeStarted = false;
     finals = [];
     state = "idle";
     setStatus(undefined);
@@ -321,15 +343,66 @@ export default function (pi: ExtensionAPI) {
     cancelled = false;
   };
 
+  /** Send a completed local recording to the loopback STT service. */
+  const finalizeLocalTranscription = (myGeneration: number) => {
+    if (localFinalizeStarted || myGeneration !== generation || state !== "stopping") return;
+    localFinalizeStarted = true;
+    const pcm = Buffer.concat(localPcmChunks);
+    localPcmChunks = [];
+    if (pcm.length === 0) {
+      if (activeCtx) activeCtx.ui.notify("No microphone audio was captured", "warning");
+      cleanup();
+      return;
+    }
+    localRequest = new AbortController();
+    fetch(`${LOCAL_STT_URL}/v1/transcriptions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/octet-stream",
+        "X-Audio-Format": "s16le",
+        "X-Sample-Rate": "16000",
+        "X-Channels": "1",
+      },
+      body: pcm,
+      signal: localRequest.signal,
+    })
+      .then(async (response) => {
+        const payload = (await response.json().catch(() => ({}))) as { error?: string; text?: string };
+        if (!response.ok) throw new Error(payload.error || `local STT returned HTTP ${response.status}`);
+        if (myGeneration !== generation || cancelled) return;
+        const text = typeof payload.text === "string" ? payload.text.trim() : "";
+        if (text) finals.push(text);
+        cleanup();
+      })
+      .catch((err: unknown) => {
+        // Cancellation deliberately aborts the request; do not surface it as a
+        // failed transcription or let a stale request clean up a newer session.
+        if (myGeneration !== generation || cancelled || (err as { name?: string })?.name === "AbortError") return;
+        if (activeCtx) {
+          activeCtx.ui.notify(
+            `Local STT failed: ${err instanceof Error ? err.message : String(err)}. Is ${LOCAL_STT_URL} running?`,
+            "error",
+          );
+        }
+        cleanup();
+      });
+  };
+
   const startDictation = (ctx: ExtensionContext) => {
+    if (!RECOGNIZER_BACKEND) {
+      ctx.ui.notify("DICTATE_BACKEND must be 'deepgram' or 'local'", "error");
+      return;
+    }
     const apiKey = process.env.DEEPGRAM_API_KEY;
-    if (!apiKey) {
+    if (RECOGNIZER_BACKEND === "deepgram" && !apiKey) {
       ctx.ui.notify("DEEPGRAM_API_KEY not set in environment", "error");
       return;
     }
 
     activeCtx = ctx;
     finals = [];
+    localPcmChunks = [];
+    localFinalizeStarted = false;
     flushed = false;
     cancelled = false;
     state = "recording";
@@ -382,10 +455,21 @@ export default function (pi: ExtensionAPI) {
       }
     });
 
+    if (RECOGNIZER_BACKEND === "local") {
+      // Keep using rec's stdout so the meter and the local backend observe the
+      // exact same PCM. Nothing is transmitted until the user stops dictation.
+      proc.stdout.on("data", (chunk: Buffer) => {
+        if (myGeneration !== generation || (state !== "recording" && state !== "stopping")) return;
+        currentLevel = rmsFromPcm16(chunk);
+        localPcmChunks.push(chunk);
+      });
+      return;
+    }
+
     // Open Deepgram WebSocket. Auth via subprotocol (portable across Node native
     // WebSocket and browsers): `new WebSocket(url, ["token", API_KEY])`.
     try {
-      ws = new WebSocket(DG_URL, ["token", apiKey]);
+      ws = new WebSocket(DG_URL, ["token", apiKey!]);
     } catch (e: any) {
       ctx.ui.notify(`Deepgram WS failed: ${e.message}`, "error");
       cleanup();
@@ -456,9 +540,25 @@ export default function (pi: ExtensionAPI) {
 
     // Stop the mic first so no more audio enqueues.
     if (rec) {
+      if (RECOGNIZER_BACKEND === "local") {
+        // Wait for stdout's final PCM bytes before asking the local model to
+        // decode. `exit` is a fallback for uncommon recorder implementations
+        // that do not emit `end` promptly after SIGTERM.
+        const myGeneration = generation;
+        const finalize = () => finalizeLocalTranscription(myGeneration);
+        rec.stdout.once("end", finalize);
+        // `exit` can precede readable-stream teardown on Node, so defer the
+        // fallback slightly and let stdout's `end` win whenever possible.
+        rec.once("exit", () => setTimeout(finalize, 50));
+      }
       try {
         rec.kill("SIGTERM");
       } catch {}
+    }
+
+    if (RECOGNIZER_BACKEND === "local") {
+      if (!rec) finalizeLocalTranscription(generation);
+      return;
     }
 
     // Tell Deepgram we're done; it will flush remaining finals then close.
@@ -539,7 +639,7 @@ export default function (pi: ExtensionAPI) {
     // Capture the TUI handle via an invisible zero-height widget. The
     // listener function reference is stable, so even if the factory re-runs
     // the TUI's listener Set de-dupes it.
-    ctx.ui.setWidget("dictate-tui-handle", (tui: TuiHandle) => {
+    ctx.ui.setWidget("dictate-tui-handle", (tui: any) => {
       dbg(`widget factory: addInputListener=${typeof tui?.addInputListener} hasFocusedComponent=${!!tui && "focusedComponent" in tui}`);
       tuiHandle = tui;
       if (typeof tui?.addInputListener === "function") {

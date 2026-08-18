@@ -71,7 +71,12 @@ class BreezeTwisterTranscriber:
         )
 
     def transcribe(self, wav_path: Path) -> str:
-        output = self._pipeline(str(wav_path))
+        # Whisper's encoder only sees 30 s at a time. With chunk_length_s=0 the
+        # pipeline hands anything longer to sequential long-form decoding, which
+        # the model can only perform when it is allowed to emit timestamp
+        # tokens. Sequential decoding keeps cross-segment context, so it is
+        # preferred over naive chunking for code-switched Mandarin.
+        output = self._pipeline(str(wav_path), return_timestamps=True)
         return str(output["text"]).strip()
 
 

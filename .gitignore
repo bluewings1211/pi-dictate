@@ -1,5 +1,6 @@
 node_modules/
 local-stt/.venv*/
 local-stt/__pycache__/
+local-stt/server.log
 local-stt/models/
 local-stt/benchmark-data/

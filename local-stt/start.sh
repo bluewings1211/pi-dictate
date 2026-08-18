@@ -50,4 +50,23 @@ if resp="$(curl --silent --max-time 2 "$health" 2>/dev/null)"; then
   fi
 fi
 
-exec "$python_bin" "$service_dir/server.py" --backend "$backend" --port "$port"
+# Launch detached with output redirected to a log file so server logs never
+# paint over the caller's terminal, and return only once /health confirms the
+# service is serving — matching the prompt-exit behavior of the skip path.
+log_file="$service_dir/server.log"
+nohup "$python_bin" "$service_dir/server.py" \
+  --backend "$backend" --port "$port" >>"$log_file" 2>&1 &
+
+for _ in $(seq 1 30); do
+  if resp="$(curl --silent --max-time 1 "$health" 2>/dev/null)"; then
+    running="$(printf '%s' "$resp" | sed -n 's/.*"backend"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+    if [[ "$running" == "$backend" ]]; then
+      echo "local-stt started (backend=$backend port=$port); log: $log_file"
+      exit 0
+    fi
+  fi
+  sleep 0.2
+done
+echo "local-stt did not become healthy on port $port; see $log_file:" >&2
+tail -n 20 "$log_file" >&2 || true
+exit 1

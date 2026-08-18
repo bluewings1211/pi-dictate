@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Start exactly one persistent local ASR model. The Pi extension always talks
 # to the same localhost API; switch models by restarting this launcher.
+#
+# Idempotent: if a local-stt server is already answering on LOCAL_STT_PORT,
+# this exits without launching a second process. A server already running a
+# different backend is an error — stop it first to switch models.
 set -euo pipefail
 
 service_dir="$(cd "$(dirname "$0")" && pwd)"
@@ -23,6 +27,27 @@ esac
 if [[ ! -x "$python_bin" ]]; then
   echo "Missing runtime: $python_bin" >&2
   exit 1
+fi
+
+# Source of truth for "already running" is our /health endpoint, which
+# answers with the active backend. curl exit 0 + a parseable backend means a
+# local-stt server owns the port; exit 7 (connection refused) means none is
+# running and we proceed. A port that answers without a recognizable health
+# payload is treated as foreign and we refuse to double-bind.
+health="http://127.0.0.1:${port}/health"
+if resp="$(curl --silent --max-time 2 "$health" 2>/dev/null)"; then
+  running="$(printf '%s' "$resp" | sed -n 's/.*"backend"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+  if [[ -n "$running" && "$running" == "$backend" ]]; then
+    echo "local-stt already running (backend=$backend port=$port); nothing to start."
+    exit 0
+  elif [[ -n "$running" ]]; then
+    echo "local-stt already running on port $port with backend '$running' (requested: '$backend')." >&2
+    echo "Model switching works by restarting the launcher; stop the current server first (e.g. pkill -f 'server.py.*--backend')." >&2
+    exit 1
+  else
+    echo "Port $port answers, but not with a local-stt health payload; refusing to start a second server." >&2
+    exit 1
+  fi
 fi
 
 exec "$python_bin" "$service_dir/server.py" --backend "$backend" --port "$port"
